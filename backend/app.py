@@ -258,7 +258,9 @@ def get_sensor_history(sensor_id):
 
 @app.route('/api/add-sensor', methods=['POST'])
 def add_sensor():
-    data = request.json
+    data = request.get_json()
+    if not data or 'name' not in data:
+        raise KeyError('name')
     db = get_db()
     cursor = db.cursor()
     cursor.execute('INSERT INTO sensors (name, type, status, lat, lon, min_threshold, max_threshold, battery_level) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
