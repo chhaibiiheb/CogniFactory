@@ -1,0 +1,5 @@
+ffmpeg -i vid1.mp4 \
+  -c:v libx264 \
+  -pix_fmt yuv420p \
+  -movflags +faststart \
+  fixed_vid1.mp4

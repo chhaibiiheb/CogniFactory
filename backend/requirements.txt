@@ -1,0 +1,8 @@
+flask
+flask-cors
+requests
+beautifulsoup4
+langchain
+langchain-chroma
+langchain-mistralai
+langchain-core

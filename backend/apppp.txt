@@ -1,0 +1,771 @@
+import sqlite3
+import time
+import traceback
+from datetime import datetime
+from threading import Thread
+import random
+import os
+import json
+
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, g, jsonify, request, Response
+from flask_cors import CORS  # MODIFICATION: Imported CORS
+
+# Imports for Mistral and LangChain
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_chroma import Chroma
+from langchain_mistralai import ChatMistralAI
+from langchain_core.messages import HumanMessage, AIMessage
+# MODIFICATION: The get_embedding_function can cause errors if the file doesn't exist.
+# We will wrap it to handle this case.
+try:
+    from get_embedding_function import get_embedding_function
+except ImportError:
+    print("WARNING: get_embedding_function not found. RAG will be disabled.")
+    get_embedding_function = None
+
+
+app = Flask(__name__)
+# MODIFICATION: Enable CORS to allow requests from your React frontend
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+DATABASE = "iot_dashboard.db"
+EASA_NEWS_RSS_URL = 'https://www.easa.europa.eu/en/newsroom-and-events/news/feed.xml'
+
+# --- Mistral Configuration ---
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+if not MISTRAL_API_KEY:
+    print("CRITICAL ERROR: MISTRAL_API_KEY environment variable not set.")
+
+RAG_PROMPT_TEMPLATE = """
+Vous êtes Aerolyze, un assistant expert en conformité aéronautique.
+Répondez à la question en vous basant uniquement sur le contexte suivant. Soyez concis, utile et répondez toujours en français.
+Si vous ne trouvez pas la réponse dans le contexte, dites simplement "Je n'ai pas trouvé l'information dans les documents fournis."
+Contexte: {context}
+---
+Question: {question}
+"""
+qa_chain = None
+llm = None
+
+# Initialize LLM first
+if MISTRAL_API_KEY:
+    try:
+        llm = ChatMistralAI(model="open-mistral-nemo", mistral_api_key=MISTRAL_API_KEY, temperature=0.7)
+        print("✅ Mistral LLM initialized successfully.")
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR: Failed to initialize Mistral LLM. Error: {e}")
+        llm = None
+else:
+    llm = None
+
+# Initialize RAG chain
+if llm and get_embedding_function:
+    try:
+        print("Initializing RAG chain with Mistral...")
+        CHROMA_PATH = "chroma"
+        embedding_function = get_embedding_function()
+        db_chroma = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_function)
+        retriever = db_chroma.as_retriever()
+        prompt = PromptTemplate(template=RAG_PROMPT_TEMPLATE, input_variables=["context", "question"])
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm, chain_type="stuff", retriever=retriever,
+            return_source_documents=True, chain_type_kwargs={"prompt": prompt},
+        )
+        print("✅ RAG chain with Mistral initialized successfully.")
+    except Exception as e:
+        qa_chain = None
+        print(f"❌ WARNING: Failed to initialize RAG chatbot. RAG will be disabled. Error: {e}")
+else:
+    print("INFO: RAG chain initialization skipped due to missing LLM or embedding function.")
+
+
+# --- Database Setup ---
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(DATABASE, check_same_thread=False)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(error):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+
+# MODIFICATION: Removed all render_template routes. React will handle the UI.
+# The root path can now be a simple health check for the API.
+@app.route('/')
+def index():
+    return "<h1>FactoryGuard Backend API</h1><p>Status: Running</p>"
+
+
+# --- Chatbot API Endpoint ---
+# MODIFICATION: Changed this endpoint to /api/ask to be consistent.
+# It now returns a single JSON response instead of streaming to match the frontend.
+@app.route("/api/ask", methods=["POST"])
+def ask():
+    if not MISTRAL_API_KEY or not llm:
+        return jsonify({"response": "Erreur: La clé API MISTRAL ou le LLM n'est pas configuré."}), 500
+    
+    request_data = request.json
+    contents = request_data.get("contents")
+    use_rag = request_data.get("use_rag", False)
+
+    if not contents:
+        return jsonify({"response": "Erreur: Aucun contenu fourni."}), 400
+    
+    if use_rag:
+        if not qa_chain:
+            return jsonify({"response": "Erreur: Le mode RAG n'est pas initialisé sur le serveur."}), 500
+        last_q = contents[-1]['parts'][0]['text']
+        try:
+            result = qa_chain.invoke({"query": last_q})
+            return jsonify({"response": result.get('result', "Pas de réponse.")})
+        except Exception as e:
+            return jsonify({"response": f"Erreur RAG: {e}"}), 500
+
+    chat_history = [HumanMessage(content=m["parts"][0]["text"]) if m.get("role") == "user" else AIMessage(content=m["parts"][0]["text"]) for m in contents]
+    
+    try:
+        result = llm.invoke(chat_history)
+        return jsonify({"response": result.content})
+    except Exception as e:
+        print(f"Mistral API Error: {e}")
+        return jsonify({"response": f"Erreur lors de la communication avec l'API Mistral: {e}"}), 500
+
+
+# --- API Routes for IoT Dashboard ---
+@app.route('/api/sensors')
+def get_sensors():
+    db = get_db()
+    query = """
+    SELECT 
+        s.id, s.name, s.type, s.status, s.lat, s.lon, s.battery_level, s.min_threshold, s.max_threshold,
+        (SELECT sd.value FROM sensor_data sd WHERE sd.sensor_id = s.id ORDER BY sd.timestamp DESC LIMIT 1) as last_value,
+        (SELECT sd.timestamp FROM sensor_data sd WHERE sd.sensor_id = s.id ORDER BY sd.timestamp DESC LIMIT 1) as last_update
+    FROM sensors s;
+    """
+    sensors = db.execute(query).fetchall()
+    return jsonify([dict(row) for row in sensors])
+
+@app.route('/api/stats')
+def get_stats():
+    db = get_db()
+    type_data = db.execute('SELECT type, COUNT(*) as count FROM sensors GROUP BY type').fetchall()
+    status_data = db.execute('SELECT status, COUNT(*) as count FROM sensors GROUP BY status').fetchall()
+    
+    # MODIFICATION: Added calculations for the KPI cards on the dashboard
+    total_sensors = db.execute("SELECT COUNT(id) FROM sensors").fetchone()[0]
+    alerts = db.execute("SELECT COUNT(id) FROM sensors WHERE status = 'Inactif' OR status = 'Maintenance'").fetchone()[0]
+    active_sensors = total_sensors - alerts
+
+    # MODIFICATION: Changed JSON keys to 'name' and 'value' to match what the frontend chart library (Recharts) expects.
+    return jsonify({
+        "by_type": [{"name": r["type"], "value": r["count"]} for r in type_data],
+        "by_status": [{"name": r["status"] if r["status"] else 'Non défini', "value": r["count"]} for r in status_data],
+        "total_sensors": total_sensors,
+        "active_sensors": active_sensors,
+        "alerts": alerts
+    })
+
+# --- All other routes and background tasks from your code remain the same ---
+# --- They are correctly designed and can be used for future features. ---
+
+@app.route('/api/sensor-history/<int:sensor_id>')
+def get_sensor_history(sensor_id):
+    db = get_db()
+    rows = db.execute("SELECT value, timestamp FROM sensor_data WHERE sensor_id = ? ORDER BY timestamp DESC LIMIT 50", (sensor_id,)).fetchall()
+    return jsonify([dict(row) for row in reversed(rows)])
+
+@app.route('/api/add-sensor', methods=['POST'])
+def add_sensor():
+    data = request.json
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute('INSERT INTO sensors (name, type, status, lat, lon, min_threshold, max_threshold, battery_level) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                   (data['name'], data['type'], data['status'], data['lat'], data['lon'], data.get('min_threshold'), data.get('max_threshold'), random.randint(90, 100)))
+    sensor_id = cursor.lastrowid
+    db.execute("INSERT INTO changes_log (change_type, description, date) VALUES (?, ?, ?)",
+               ('ajout', f"Nouveau capteur ajouté: {data['name']}", datetime.now()))
+    db.commit()
+    return jsonify({"status": "success", "id": sensor_id})
+
+@app.route('/api/update-sensor/<int:sensor_id>', methods=['POST'])
+def update_sensor(sensor_id):
+    data = request.json
+    db = get_db()
+    db.execute('UPDATE sensors SET name=?, type=?, status=?, lat=?, lon=?, min_threshold=?, max_threshold=? WHERE id=?',
+               (data['name'], data['type'], data['status'], data.get('lat'), data.get('lon'), data.get('min_threshold'), data.get('max_threshold'), sensor_id))
+    db.execute("INSERT INTO changes_log (change_type, description, date) VALUES (?, ?, ?)",
+               ('modification', f"Capteur modifié: {data['name']}", datetime.now()))
+    db.commit()
+    return jsonify({"status": "success"})
+
+@app.route('/api/delete-sensor/<int:sensor_id>', methods=['POST'])
+def delete_sensor(sensor_id):
+    db = get_db()
+    sensor = db.execute('SELECT name FROM sensors WHERE id=?', (sensor_id,)).fetchone()
+    if sensor:
+        db.execute("INSERT INTO changes_log (change_type, description, date) VALUES (?, ?, ?)",
+                   ('suppression', f"Capteur supprimé: {sensor['name']}", datetime.now()))
+        db.execute('DELETE FROM sensor_data WHERE sensor_id=?', (sensor_id,))
+        db.execute('DELETE FROM sensors WHERE id=?', (sensor_id,))
+        db.commit()
+    return jsonify({"status": "deleted"})
+
+@app.route('/api/activity-log')
+def get_activity_log():
+    db = get_db()
+    rows = db.execute("SELECT description, date FROM changes_log WHERE change_type != 'actualité' ORDER BY date DESC LIMIT 10").fetchall()
+    return jsonify([dict(row) for row in rows])
+
+@app.route('/api/news')
+def get_news():
+    db = get_db()
+    rows = db.execute("SELECT id, description, date, link, seen FROM changes_log WHERE change_type = 'actualité' ORDER BY seen ASC, date DESC LIMIT 15").fetchall()
+    return jsonify([dict(row) for row in rows])
+
+@app.route('/api/unread-count')
+def get_unread_count():
+    db = get_db()
+    count = db.execute("SELECT COUNT(id) FROM changes_log WHERE seen = 0 AND change_type = 'actualité'").fetchone()[0]
+    return jsonify({"count": count})
+
+@app.route('/api/mark-read', methods=['POST'])
+def mark_read():
+    ids = request.json.get("ids", [])
+    if not ids: return jsonify({"status": "no_ids_provided"})
+    db = get_db()
+    query = "UPDATE changes_log SET seen = 1 WHERE id IN ({})".format(','.join('?' for _ in ids))
+    db.execute(query, ids)
+    db.commit()
+    return jsonify({"status": "marked_as_read"})
+
+def fetch_easa_news_from_rss():
+    # This function remains unchanged
+    pass
+
+def update_news_notifications():
+    # This function remains unchanged
+    pass
+
+def background_task_scheduler():
+    # This function remains unchanged
+    pass
+
+# Mettez cette fonction à la place de l'ancienne fonction vide ou de la simulation de base
+def simulate_sensor_data_logging():
+    """
+    Cette fonction s'exécute dans un thread séparé en arrière-plan.
+    Elle simule l'arrivée de nouvelles données de capteurs toutes les 5 secondes.
+    """
+    print("✅ [Simulation] Démarrage du thread de simulation des capteurs...")
+    
+    while True:
+        try:
+            # IMPORTANT : Chaque thread doit créer sa propre connexion à la base de données.
+            # Ne pas utiliser le get_db() de Flask qui est lié au contexte d'une requête.
+            conn = sqlite3.connect(DATABASE, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # 1. Sélectionner uniquement les capteurs actifs
+            active_sensors = cursor.execute("SELECT id, name, type, min_threshold, max_threshold FROM sensors WHERE status = 'Actif'").fetchall()
+            
+            if not active_sensors:
+                print("INFO [Simulation] Aucun capteur actif trouvé, en attente...")
+            else:
+                print(f"INFO [Simulation] Génération de données pour {len(active_sensors)} capteur(s) actif(s)...")
+
+            for sensor in active_sensors:
+                # 2. Obtenir la dernière valeur pour simuler une dérive réaliste
+                last_data = cursor.execute(
+                    "SELECT value FROM sensor_data WHERE sensor_id = ? ORDER BY timestamp DESC LIMIT 1",
+                    (sensor['id'],)
+                ).fetchone()
+
+                if last_data:
+                    last_value = last_data['value']
+                    # 3. Générer une petite variation autour de la dernière valeur
+                    change = random.uniform(-0.5, 0.5) # Variation plus faible pour le réalisme
+                    new_value = last_value + change
+                    
+                    # S'assurer que la valeur ne dérive pas trop loin des seuils
+                    if sensor['min_threshold'] is not None and new_value < sensor['min_threshold'] - 5:
+                        new_value = sensor['min_threshold']
+                    if sensor['max_threshold'] is not None and new_value > sensor['max_threshold'] + 5:
+                        new_value = sensor['max_threshold']
+
+                else:
+                    # Si aucune donnée n'existe, générer une première valeur au milieu de la plage
+                    if sensor['min_threshold'] is not None and sensor['max_threshold'] is not None:
+                         new_value = random.uniform(sensor['min_threshold'], sensor['max_threshold'])
+                    else:
+                        new_value = random.uniform(10, 25) # Valeur par défaut si pas de seuils
+
+                # 4. Insérer la nouvelle donnée
+                timestamp = datetime.now()
+                cursor.execute(
+                    "INSERT INTO sensor_data (sensor_id, value, timestamp) VALUES (?, ?, ?)",
+                    (sensor['id'], new_value, timestamp)
+                )
+                # print(f"  -> Capteur '{sensor['name']}': nouvelle valeur {new_value:.2f}")
+
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+        except sqlite3.OperationalError as e:
+            print(f"❌ ERREUR [Simulation] Erreur de base de données (probablement verrouillée) : {e}. Nouvelle tentative dans 5s.")
+        except Exception as e:
+            print(f"❌ ERREUR [Simulation] Une erreur inattendue est survenue : {e}")
+            traceback.print_exc()
+            
+        # 5. Attendre 5 secondes avant la prochaine itération
+        time.sleep(5)
+
+import sqlite3
+import time
+import traceback
+from datetime import datetime
+from threading import Thread
+import random
+import os
+import json
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, g, jsonify, request, Response
+from flask_cors import CORS
+
+# Imports for Mistral and LangChain
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_chroma import Chroma
+from langchain_mistralai import ChatMistralAI
+from langchain_core.messages import HumanMessage, AIMessage
+
+try:
+    from get_embedding_function import get_embedding_function
+except ImportError:
+    print("WARNING: get_embedding_function not found. RAG will be disabled.")
+    get_embedding_function = None
+
+
+# --- Flask App Configuration ---
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+DATABASE = "iot_dashboard.db"
+EASA_NEWS_RSS_URL = 'https://www.easa.europa.eu/en/newsroom-and-events/news/feed.xml'
+
+# --- Mistral Configuration ---
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+if not MISTRAL_API_KEY:
+    print("CRITICAL ERROR: MISTRAL_API_KEY environment variable not set.")
+
+RAG_PROMPT_TEMPLATE = """
+Vous êtes Aerolyze, un assistant expert en conformité aéronautique.
+Répondez à la question en vous basant uniquement sur le contexte suivant. Soyez concis, utile et répondez toujours en français.
+Si vous ne trouvez pas la réponse dans le contexte, dites simplement "Je n'ai pas trouvé l'information dans les documents fournis."
+Contexte: {context}
+---
+Question: {question}
+"""
+qa_chain = None
+llm = None
+
+if MISTRAL_API_KEY:
+    try:
+        llm = ChatMistralAI(model="open-mistral-nemo", mistral_api_key=MISTRAL_API_KEY, temperature=0.7)
+        print("✅ Mistral LLM initialized successfully.")
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR: Failed to initialize Mistral LLM. Error: {e}")
+        llm = None
+else:
+    llm = None
+
+if llm and get_embedding_function:
+    try:
+        print("Initializing RAG chain with Mistral...")
+        CHROMA_PATH = "chroma"
+        embedding_function = get_embedding_function()
+        db_chroma = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_function)
+        retriever = db_chroma.as_retriever()
+        prompt = PromptTemplate(template=RAG_PROMPT_TEMPLATE, input_variables=["context", "question"])
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm, chain_type="stuff", retriever=retriever,
+            return_source_documents=True, chain_type_kwargs={"prompt": prompt},
+        )
+        print("✅ RAG chain with Mistral initialized successfully.")
+    except Exception as e:
+        qa_chain = None
+        print(f"❌ WARNING: Failed to initialize RAG chatbot. RAG will be disabled. Error: {e}")
+else:
+    print("INFO: RAG chain initialization skipped due to missing LLM or embedding function.")
+
+
+# --- Database Setup ---
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(DATABASE, check_same_thread=False)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(error):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+# --- API Routes ---
+@app.route('/')
+def index():
+    return "<h1>FactoryGuard Backend API</h1><p>Status: Running</p>"
+
+#####bouton diagnostic
+@app.route('/api/diagnose-sensor', methods=['POST'])
+def diagnose_sensor():
+    """
+    Reçoit l'ID d'un capteur, récupère ses métadonnées et son historique récent,
+    puis demande à l'IA de fournir un diagnostic.
+    """
+    # 1. Vérifier que l'IA est disponible
+    if not llm:
+        return jsonify({"error": "Le service d'IA n'est pas configuré sur le serveur."}), 503
+
+    # 2. Récupérer l'ID du capteur envoyé par le frontend
+    sensor_id = request.json.get('sensor_id')
+    if not sensor_id:
+        return jsonify({"error": "Aucun ID de capteur fourni."}), 400
+
+    # 3. Récupérer les informations et l'historique du capteur depuis notre BDD
+    db = get_db()
+    sensor_info = db.execute('SELECT * FROM sensors WHERE id = ?', (sensor_id,)).fetchone()
+    if not sensor_info:
+        return jsonify({"error": "Capteur non trouvé."}), 404
+        
+    sensor_history = db.execute(
+        'SELECT value, timestamp FROM sensor_data WHERE sensor_id = ? ORDER BY timestamp DESC LIMIT 50', 
+        (sensor_id,)
+    ).fetchall()
+
+    # Convertir les données en dictionnaires pour le prompt
+    sensor_info_dict = dict(sensor_info)
+    sensor_history_list = [dict(row) for row in sensor_history]
+
+    # 4. Construire le prompt pour l'expert en maintenance
+    prompt = f"""
+    Vous êtes un technicien de maintenance expert et un analyste de données pour FactoryGuard AI.
+    Votre mission est de diagnostiquer l'état d'un capteur en vous basant sur ses métadonnées et son historique de valeurs récent.
+
+    **Données du capteur :**
+    - Nom: {sensor_info_dict['name']}
+    - Type: {sensor_info_dict['type']}
+    - Statut actuel: {sensor_info_dict['status']}
+    - Seuil minimum acceptable: {sensor_info_dict['min_threshold']}
+    - Seuil maximum acceptable: {sensor_info_dict['max_threshold']}
+
+    **Historique récent des valeurs (les plus récentes en premier) :**
+    {json.dumps(sensor_history_list, indent=2, ensure_ascii=False)}
+
+    **Votre analyse doit contenir les sections suivantes :**
+    1.  **Diagnostic :** Donnez un résumé de l'état du capteur. Est-il stable ? Y a-t-il des anomalies (pics, chutes brutales, dérive constante) ? Est-il en dehors de ses seuils de fonctionnement ?
+    2.  **Niveau de Risque :** Évaluez le risque sur une échelle de Faible, Moyen, Élevé.
+    3.  **Recommandation :** Proposez une action concrète et claire. (ex: "Aucune action requise, surveillance continue.", "Vérifier la connectivité et l'alimentation du capteur.", "Intervention de maintenance préventive recommandée dans les 24h.", "Arrêt immédiat de l'équipement associé et inspection du capteur.").
+
+    Soyez précis, factuel et répondez en français.
+    """
+
+    try:
+        # 5. Envoyer le prompt au LLM et retourner le résultat
+        result = llm.invoke(prompt)
+        return jsonify({"diagnosis": result.content})
+
+    except Exception as e:
+        print(f"❌ ERREUR [IA Diagnose] : {e}")
+        return jsonify({"error": "Une erreur est survenue lors du diagnostic IA."}), 500
+####llm l sensors
+@app.route('/api/generate-summary', methods=['POST'])
+def generate_summary():
+    """
+    Reçoit des données de capteurs en JSON, les envoie au LLM avec un prompt
+    spécifique et retourne un résumé analytique.
+    """
+    # 1. Vérifier que le LLM est bien disponible
+    if not llm:
+        return jsonify({"error": "Le service d'IA n'est pas configuré sur le serveur."}), 503
+
+    # 2. Récupérer les données envoyées par le frontend
+    sensors_data = request.json.get('sensors')
+    if not sensors_data:
+        return jsonify({"error": "Aucune donnée de capteur fournie."}), 400
+
+    # 3. Créer le prompt pour l'IA. C'est la partie la plus importante !
+    #    Nous formatons les données en une chaîne JSON pour que le LLM puisse les lire facilement.
+    sensors_json_string = json.dumps(sensors_data, indent=2, ensure_ascii=False)
+    
+    prompt = f"""
+    Vous êtes 'FactoryGuard AI', un analyste expert en opérations industrielles pour un manager.
+    Votre ton doit être professionnel, concis et aller droit au but.
+
+    En vous basant sur les données JSON suivantes qui représentent l'état actuel de tous les capteurs, générez un rapport de situation en 3 points maximum.
+    Mettez en évidence les anomalies critiques en premier (valeurs hors seuil, statut 'Inactif').
+    Mentionnez les points de vigilance (batterie faible < 30%, statut 'Maintenance').
+    Concluez par un état général du système (ex: 'Opérations nominales', 'Vigilance requise', 'Action immédiate nécessaire').
+
+    Répondez uniquement en français.
+
+    Voici les données :
+    {sensors_json_string}
+    """
+
+    try:
+        # 4. Envoyer le prompt au LLM
+        # Nous utilisons invoke directement car ce n'est pas une conversation
+        result = llm.invoke(prompt)
+        
+        # 5. Renvoyer la réponse générée au frontend
+        return jsonify({"summary": result.content})
+
+    except Exception as e:
+        print(f"❌ ERREUR [IA Summary] : {e}")
+        return jsonify({"error": "Une erreur est survenue lors de la génération du rapport."}), 500
+# Chatbot API Endpoint
+@app.route("/api/ask", methods=["POST"])
+def ask():
+    if not MISTRAL_API_KEY or not llm:
+        return jsonify({"response": "Erreur: La clé API MISTRAL ou le LLM n'est pas configuré."}), 500
+    
+    request_data = request.json
+    contents = request_data.get("contents")
+    use_rag = request_data.get("use_rag", False)
+
+    if not contents:
+        return jsonify({"response": "Erreur: Aucun contenu fourni."}), 400
+    
+    if use_rag:
+        if not qa_chain:
+            return jsonify({"response": "Erreur: Le mode RAG n'est pas initialisé sur le serveur."}), 500
+        last_q = contents[-1]['parts'][0]['text']
+        try:
+            result = qa_chain.invoke({"query": last_q})
+            return jsonify({"response": result.get('result', "Pas de réponse.")})
+        except Exception as e:
+            return jsonify({"response": f"Erreur RAG: {e}"}), 500
+
+    chat_history = [HumanMessage(content=m["parts"][0]["text"]) if m.get("role") == "user" else AIMessage(content=m["parts"][0]["text"]) for m in contents]
+    
+    try:
+        result = llm.invoke(chat_history)
+        return jsonify({"response": result.content})
+    except Exception as e:
+        print(f"Mistral API Error: {e}")
+        return jsonify({"response": f"Erreur lors de la communication avec l'API Mistral: {e}"}), 500
+####s
+# API Routes for IoT Dashboard
+@app.route('/api/sensors')
+def get_sensors():
+    db = get_db()
+    query = """
+    SELECT 
+        s.id, s.name, s.type, s.status, s.lat, s.lon, s.battery_level, s.min_threshold, s.max_threshold,
+        (SELECT sd.value FROM sensor_data sd WHERE sd.sensor_id = s.id ORDER BY sd.timestamp DESC LIMIT 1) as last_value,
+        (SELECT sd.timestamp FROM sensor_data sd WHERE sd.sensor_id = s.id ORDER BY sd.timestamp DESC LIMIT 1) as last_update
+    FROM sensors s;
+    """
+    sensors = db.execute(query).fetchall()
+    return jsonify([dict(row) for row in sensors])
+
+@app.route('/api/stats')
+def get_stats():
+    db = get_db()
+    type_data = db.execute('SELECT type, COUNT(*) as count FROM sensors GROUP BY type').fetchall()
+    status_data = db.execute('SELECT status, COUNT(*) as count FROM sensors GROUP BY status').fetchall()
+    
+    total_sensors = db.execute("SELECT COUNT(id) FROM sensors").fetchone()[0]
+    alerts = db.execute("SELECT COUNT(id) FROM sensors WHERE status = 'Inactif' OR status = 'Maintenance'").fetchone()[0]
+    active_sensors = total_sensors - alerts
+
+    return jsonify({
+        "by_type": [{"name": r["type"], "value": r["count"]} for r in type_data],
+        "by_status": [{"name": r["status"] if r["status"] else 'Non défini', "value": r["count"]} for r in status_data],
+        "total_sensors": total_sensors,
+        "active_sensors": active_sensors,
+        "alerts": alerts
+    })
+
+@app.route('/api/sensor-history/<int:sensor_id>')
+def get_sensor_history(sensor_id):
+    db = get_db()
+    rows = db.execute("SELECT value, timestamp FROM sensor_data WHERE sensor_id = ? ORDER BY timestamp DESC LIMIT 50", (sensor_id,)).fetchall()
+    return jsonify([dict(row) for row in reversed(rows)])
+
+@app.route('/api/add-sensor', methods=['POST'])
+def add_sensor():
+    data = request.json
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute('INSERT INTO sensors (name, type, status, lat, lon, min_threshold, max_threshold, battery_level) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                   (data['name'], data['type'], data['status'], data['lat'], data['lon'], data.get('min_threshold'), data.get('max_threshold'), random.randint(90, 100)))
+    sensor_id = cursor.lastrowid
+    db.execute("INSERT INTO changes_log (change_type, description, date) VALUES (?, ?, ?)",
+               ('ajout', f"Nouveau capteur ajouté: {data['name']}", datetime.now()))
+    db.commit()
+    return jsonify({"status": "success", "id": sensor_id})
+
+@app.route('/api/update-sensor/<int:sensor_id>', methods=['POST'])
+def update_sensor(sensor_id):
+    data = request.json
+    db = get_db()
+    db.execute('UPDATE sensors SET name=?, type=?, status=?, lat=?, lon=?, min_threshold=?, max_threshold=? WHERE id=?',
+               (data['name'], data['type'], data['status'], data.get('lat'), data.get('lon'), data.get('min_threshold'), data.get('max_threshold'), sensor_id))
+    db.execute("INSERT INTO changes_log (change_type, description, date) VALUES (?, ?, ?)",
+               ('modification', f"Capteur modifié: {data['name']}", datetime.now()))
+    db.commit()
+    return jsonify({"status": "success"})
+
+@app.route('/api/delete-sensor/<int:sensor_id>', methods=['POST'])
+def delete_sensor(sensor_id):
+    db = get_db()
+    sensor = db.execute('SELECT name FROM sensors WHERE id=?', (sensor_id,)).fetchone()
+    if sensor:
+        db.execute("INSERT INTO changes_log (change_type, description, date) VALUES (?, ?, ?)",
+                   ('suppression', f"Capteur supprimé: {sensor['name']}", datetime.now()))
+        db.execute('DELETE FROM sensor_data WHERE sensor_id=?', (sensor_id,))
+        db.execute('DELETE FROM sensors WHERE id=?', (sensor_id,))
+        db.commit()
+    return jsonify({"status": "deleted"})
+
+@app.route('/api/activity-log')
+def get_activity_log():
+    db = get_db()
+    rows = db.execute("SELECT description, date FROM changes_log WHERE change_type != 'actualité' ORDER BY date DESC LIMIT 10").fetchall()
+    return jsonify([dict(row) for row in rows])
+
+@app.route('/api/news')
+def get_news():
+    db = get_db()
+    rows = db.execute("SELECT id, description, date, link, seen FROM changes_log WHERE change_type = 'actualité' ORDER BY seen ASC, date DESC LIMIT 15").fetchall()
+    return jsonify([dict(row) for row in rows])
+
+@app.route('/api/unread-count')
+def get_unread_count():
+    db = get_db()
+    count = db.execute("SELECT COUNT(id) FROM changes_log WHERE seen = 0 AND change_type = 'actualité'").fetchone()[0]
+    return jsonify({"count": count})
+
+@app.route('/api/mark-read', methods=['POST'])
+def mark_read():
+    ids = request.json.get("ids", [])
+    if not ids: return jsonify({"status": "no_ids_provided"})
+    db = get_db()
+    query = "UPDATE changes_log SET seen = 1 WHERE id IN ({})".format(','.join('?' for _ in ids))
+    db.execute(query, ids)
+    db.commit()
+    return jsonify({"status": "marked_as_read"})
+
+# --- Background Tasks ---
+
+def fetch_easa_news_from_rss():
+    # Placeholder for EASA news fetching logic
+    pass
+
+def update_news_notifications():
+    # Placeholder for news update logic
+    pass
+
+def background_task_scheduler():
+    # Placeholder for scheduling background tasks
+    pass
+
+def simulate_sensor_data_logging():
+    """
+    Cette fonction s'exécute dans un thread séparé en arrière-plan.
+    Elle simule l'arrivée de nouvelles données de capteurs toutes les 5 secondes.
+    """
+    print("✅ [Simulation] Démarrage du thread de simulation des capteurs...")
+    
+    while True:
+        try:
+            # Chaque thread doit créer sa propre connexion à la base de données.
+            conn = sqlite3.connect(DATABASE, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            active_sensors = cursor.execute("SELECT id, name, type, min_threshold, max_threshold FROM sensors WHERE status = 'Actif'").fetchall()
+            
+            if not active_sensors:
+                print("INFO [Simulation] Aucun capteur actif trouvé, en attente...")
+            else:
+                print(f"INFO [Simulation] Génération de données pour {len(active_sensors)} capteur(s) actif(s)...")
+
+            for sensor in active_sensors:
+                last_data = cursor.execute(
+                    "SELECT value FROM sensor_data WHERE sensor_id = ? ORDER BY timestamp DESC LIMIT 1",
+                    (sensor['id'],)
+                ).fetchone()
+
+                if last_data:
+                    last_value = last_data['value']
+                    change = random.uniform(-15, 2.5)
+                    new_value = last_value + change
+                    
+                    if sensor['min_threshold'] is not None and new_value < sensor['min_threshold'] - 15:
+                        new_value = sensor['min_threshold']
+                    if sensor['max_threshold'] is not None and new_value > sensor['max_threshold'] + 5:
+                        new_value = sensor['max_threshold']
+                else:
+                    if sensor['min_threshold'] is not None and sensor['max_threshold'] is not None:
+                         new_value = random.uniform(sensor['min_threshold'], sensor['max_threshold'])
+                    else:
+                        new_value = random.uniform(10, 25)
+
+                timestamp = datetime.now()
+                cursor.execute(
+                    "INSERT INTO sensor_data (sensor_id, value, timestamp) VALUES (?, ?, ?)",
+                    (sensor['id'], new_value, timestamp)
+                )
+
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+        except sqlite3.OperationalError as e:
+            print(f"❌ ERREUR [Simulation] Erreur de base de données (probablement verrouillée) : {e}. Nouvelle tentative dans 5s.")
+        except Exception as e:
+            print(f"❌ ERREUR [Simulation] Une erreur inattendue est survenue : {e}")
+            traceback.print_exc()
+            
+        time.sleep(5)
+
+# --- Application Entry Point ---
+if __name__ == '__main__':
+    if not os.path.exists(DATABASE):
+        with app.app_context():
+            db = get_db()
+            db.execute('CREATE TABLE sensors (id INTEGER PRIMARY KEY, name TEXT, type TEXT, status TEXT, lat REAL, lon REAL, battery_level INTEGER, min_threshold REAL, max_threshold REAL);')
+            db.execute('CREATE TABLE sensor_data (id INTEGER PRIMARY KEY, sensor_id INTEGER, value REAL, timestamp DATETIME, FOREIGN KEY(sensor_id) REFERENCES sensors(id));')
+            db.execute('CREATE TABLE changes_log (id INTEGER PRIMARY KEY, change_type TEXT, description TEXT, date DATETIME, link TEXT, seen INTEGER DEFAULT 0);')
+            demo_sensors = [
+                ('Thermo-Paris-01', 'Température', 'Actif', 48.8566, 2.3522, 98, 0, 30),
+                ('Hygro-Lyon-4A', 'Humidité', 'Actif', 45.7640, 4.8357, 95, 20, 70),
+                ('Baro-Marseille-P1', 'Pression', 'Inactif', 43.2965, 5.3698, 75, 1000, 1020),
+                ('Air-Lille-Nord', 'Qualité de l\'air', 'Actif', 50.6292, 3.0573, 88, 0, 100),
+                ('Thermo-Nice-Sud', 'Température', 'Maintenance', 43.7102, 7.2620, 23, 5, 28)
+            ]
+            for s in demo_sensors:
+                db.execute('INSERT INTO sensors (name, type, status, lat, lon, battery_level, min_threshold, max_threshold) VALUES (?,?,?,?,?,?,?,?)', s)
+            db.commit()
+            print("Database created and populated with demo data.")
+
+    # Démarrage du thread de simulation en arrière-plan
+    sensor_sim_thread = Thread(target=simulate_sensor_data_logging, daemon=True)
+    sensor_sim_thread.start()
+    
+    # Démarrage du serveur web Flask
+    print("🚀 Démarrage du serveur Flask sur http://0.0.0.0:5000")
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
