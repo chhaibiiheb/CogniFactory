@@ -167,11 +167,9 @@ def ask():
     
     try:
         result = llm.invoke(chat_history)
-        return jsonify({"response": result.content})
+        response_text = result.content if hasattr(result, 'content') else str(result)
+        return jsonify({"response": response_text})
     except Exception as e:
-        # --- BACKUP: Original Mistral error message (commented out) ---
-        # print(f"Mistral API Error: {e}")
-        # return jsonify({"response": f"Erreur lors de la communication avec l'API Mistral: {e}"}), 500
         print(f"Ollama API Error: {e}")
         return jsonify({"response": f"Erreur lors de la communication avec Ollama: {e}"}), 500
 
@@ -444,9 +442,9 @@ Analysez cette image provenant de: {video_title} (à {current_time}s)
 
 @app.route('/api/generate-summary', methods=['POST'])
 def generate_summary():
-    """Generate a summary report of all sensors using Mistral AI"""
-    if not MISTRAL_API_KEY or not llm:
-        return jsonify({"error": "Erreur: La clé API MISTRAL ou le LLM n'est pas configuré."}), 500
+    """Generate a summary report of all sensors using the configured LLM"""
+    if not llm:
+        return jsonify({"error": "Erreur: Le LLM n'est pas configuré."}), 500
     
     data = request.json
     sensors = data.get('sensors', [])
@@ -528,8 +526,8 @@ Soyez concis, clair et professionnel.
 
         # Call Mistral
         result = llm.invoke([HumanMessage(content=summary_prompt)])
-        
-        return jsonify({"summary": result.content})
+        summary_text = result.content if hasattr(result, 'content') else str(result)
+        return jsonify({"summary": summary_text})
     
     except Exception as e:
         print(f"Erreur lors de la génération du rapport: {e}")
@@ -538,9 +536,9 @@ Soyez concis, clair et professionnel.
 
 @app.route('/api/diagnose-sensor', methods=['POST'])
 def diagnose_sensor():
-    """Diagnose a sensor using Mistral AI"""
-    if not MISTRAL_API_KEY or not llm:
-        return jsonify({"error": "Erreur: La clé API MISTRAL ou le LLM n'est pas configuré."}), 500
+    """Diagnose a sensor using the configured LLM"""
+    if not llm:
+        return jsonify({"error": "Erreur: Le LLM n'est pas configuré."}), 500
     
     data = request.json
     sensor_id = data.get('sensor_id')
@@ -602,8 +600,8 @@ Veuillez fournir:
         
         # Call Mistral
         result = llm.invoke([HumanMessage(content=diagnosis_prompt)])
-        
-        return jsonify({"diagnosis": result.content})
+        diagnosis_text = result.content if hasattr(result, 'content') else str(result)
+        return jsonify({"diagnosis": diagnosis_text})
     
     except Exception as e:
         print(f"Erreur lors du diagnostic: {e}")
