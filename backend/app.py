@@ -12,11 +12,11 @@ from bs4 import BeautifulSoup
 from flask import Flask, g, jsonify, request, Response, send_file
 from flask_cors import CORS  # MODIFICATION: Imported CORS
 
-# Imports for Mistral and LangChain
+# Imports for Ollama and LangChain
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_chroma import Chroma
-from langchain_mistralai import ChatMistralAI
+from langchain_ollama import OllamaLLM
 from langchain_core.messages import HumanMessage, AIMessage
 # MODIFICATION: The get_embedding_function can cause errors if the file doesn't exist.
 # We will wrap it to handle this case.
@@ -40,10 +40,11 @@ def log_request():
 DATABASE = "iot_dashboard.db"
 EASA_NEWS_RSS_URL = 'https://www.easa.europa.eu/en/newsroom-and-events/news/feed.xml'
 
-# --- Mistral Configuration ---
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-if not MISTRAL_API_KEY:
-    print("CRITICAL ERROR: MISTRAL_API_KEY environment variable not set.")
+# --- Ollama Configuration ---
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+print(f"Initializing Ollama with model: {OLLAMA_MODEL} at {OLLAMA_BASE_URL}")
 
 RAG_PROMPT_TEMPLATE = """
 Vous êtes Aerolyze, un assistant expert en conformité aéronautique.
@@ -56,21 +57,22 @@ Question: {question}
 qa_chain = None
 llm = None
 
-# Initialize LLM first
-if MISTRAL_API_KEY:
-    try:
-        llm = ChatMistralAI(model="mistral-large-2512", mistral_api_key=MISTRAL_API_KEY, temperature=0.7)
-        print("✅ Mistral LLM initialized successfully.")
-    except Exception as e:
-        print(f"❌ CRITICAL ERROR: Failed to initialize Mistral LLM. Error: {e}")
-        llm = None
-else:
+# Initialize LLM with Ollama
+try:
+    llm = OllamaLLM(
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        temperature=0.7
+    )
+    print("✅ Ollama LLM initialized successfully.")
+except Exception as e:
+    print(f"❌ CRITICAL ERROR: Failed to initialize Ollama LLM. Error: {e}")
     llm = None
 
 # Initialize RAG chain
 if llm and get_embedding_function:
     try:
-        print("Initializing RAG chain with Mistral...")
+        print("Initializing RAG chain with Ollama...")
         CHROMA_PATH = "chroma"
         embedding_function = get_embedding_function()
         db_chroma = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_function)
@@ -80,7 +82,7 @@ if llm and get_embedding_function:
             llm=llm, chain_type="stuff", retriever=retriever,
             return_source_documents=True, chain_type_kwargs={"prompt": prompt},
         )
-        print("✅ RAG chain with Mistral initialized successfully.")
+        print("✅ RAG chain with Ollama initialized successfully.")
     except Exception as e:
         qa_chain = None
         print(f"❌ WARNING: Failed to initialize RAG chatbot. RAG will be disabled. Error: {e}")
@@ -114,8 +116,8 @@ def index():
 # It now returns a single JSON response instead of streaming to match the frontend.
 @app.route("/api/ask", methods=["POST"])
 def ask():
-    if not MISTRAL_API_KEY or not llm:
-        return jsonify({"response": "Erreur: La clé API MISTRAL ou le LLM n'est pas configuré."}), 500
+    if not llm:
+        return jsonify({"response": "Erreur: Le LLM Ollama n'est pas configuré."}), 500
     
     request_data = request.json
     contents = request_data.get("contents")
@@ -140,8 +142,8 @@ def ask():
         result = llm.invoke(chat_history)
         return jsonify({"response": result.content})
     except Exception as e:
-        print(f"Mistral API Error: {e}")
-        return jsonify({"response": f"Erreur lors de la communication avec l'API Mistral: {e}"}), 500
+        print(f"Ollama API Error: {e}")
+        return jsonify({"response": f"Erreur lors de la communication avec Ollama: {e}"}), 500
 
 
 # --- API Routes for IoT Dashboard ---

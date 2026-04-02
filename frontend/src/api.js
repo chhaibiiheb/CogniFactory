@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // This client points to your Flask backend.
 const apiClient = axios.create({
-    baseURL: 'http://127.0.0.1:5000/api',
+    baseURL: 'http://20.51.200.142:5000/api',
     headers: {
         'Content-Type': 'application/json'
     }
@@ -18,7 +18,7 @@ export const diagnoseSensor = (sensorId) => {
     return axios.post(`${API_URL}/api/diagnose-sensor`, { sensor_id: sensorId });
 };
 // dans src/api.js (ou autre)
-const API_URL = 'http://127.0.0.1:5000'; // ou votre URL d'API
+const API_URL = 'http://20.51.200.142:5000'; // ou votre URL d'API
 
 // ... autres fonctions
 export const getSensorHistory = (sensorId) => axios.get(`${API_URL}/api/sensor-history/${sensorId}`);
