@@ -5,4 +5,5 @@ beautifulsoup4
 langchain
 langchain-chroma
 langchain-ollama
+# langchain-mistralai  # BACKUP: Commented out - original Mistral API dependency
 langchain-core
