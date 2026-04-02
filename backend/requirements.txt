@@ -1,8 +1,9 @@
-Flask==3.1.0
-Flask-Cors==5.0.0
-Requests==2.32.3
-BeautifulSoup4==4.12.3
-LangChain==0.3.23
-LangChain-Chroma==0.2.4
-LangChain-Mistralai==0.2.11
-LangChain-Core==0.3.68
+flask==3.1.0
+flask-cors==5.0.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+langchain==0.3.23
+langchain-chroma==0.2.4
+langchain-ollama==0.2.3
+# langchain-mistralai==0.2.11  # BACKUP: Commented out - original Mistral API dependency
+langchain-core==0.3.68
